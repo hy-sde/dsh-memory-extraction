@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { MemoryExtractionEngine } from '../src/engine.ts'
-import { MAX_MEMORY_EXTRACTION_MODEL_CALLS } from '../src/engine.ts'
-import type { MemoryExtractionPorts, MemoryGenerateResult } from '../src/engine.ts'
+import { MAX_MEMORY_EXTRACTION_MODEL_CALLS, memoryGapIdForContent } from '../src/engine.ts'
+import type { MemoryExtractionPorts, MemoryGenerateResult, MemoryExtractionEngineOptions } from '../src/engine.ts'
 import type {
   AdmittedMemoryItem,
   MemoryExtractionEventEntry,
+  MemoryExtractionGapEntry,
   MemoryExtractionGate,
   MemoryExtractionSourceSnapshot,
   MemoryExtractionTextEvent,
@@ -12,13 +13,16 @@ import type {
 
 /**
  * The engine state machine over fake ports: idempotency, empty-range advance,
- * admission, one-retry-then-discard, gate checks, and the 3-call budget.
+ * admission, one-retry-then-discard, gate checks, the 3-call budget, and the
+ * E1 cross-session evidence floor (gap ledger + corroboration gate).
  */
 
 interface FakeState {
   events?: ReadonlyArray<MemoryExtractionEventEntry>
   gate?: (snapshot: MemoryExtractionSourceSnapshot) => MemoryExtractionGate
   generate?: (stage: string, prompt: string) => MemoryGenerateResult | Promise<MemoryGenerateResult>
+  gaps?: ReadonlyArray<MemoryExtractionGapEntry>
+  options?: MemoryExtractionEngineOptions
 }
 
 interface FakeWorld {
@@ -28,6 +32,7 @@ interface FakeWorld {
   cursor: Map<string, { processedSeq: number; updatedAt: number }>
   receipts: Map<string, { status: string; items: string[] }>
   failures: Map<string, Record<string, unknown>>
+  gaps: Map<string, MemoryExtractionGapEntry>
   gateCalls: number
 }
 
@@ -54,6 +59,7 @@ function makeWorld(initial: FakeState = {}): FakeWorld {
     cursor: new Map(),
     receipts: new Map(),
     failures: new Map(),
+    gaps: new Map((initial.gaps ?? []).map(entry => [entry.id, entry])),
     gateCalls: 0,
     ports: undefined as unknown as MemoryExtractionPorts,
   }
@@ -75,7 +81,7 @@ function makeWorld(initial: FakeState = {}): FakeWorld {
       const row = world.receipts.get(operationId)
       return row === undefined
         ? undefined
-        : { operationId, sessionId: 's1', status: row.status as 'extracted' | 'skipped' | 'discarded', items: row.items, committedAt: 1 }
+        : { operationId, sessionId: 's1', status: row.status as 'extracted' | 'skipped' | 'discarded' | 'pending', items: row.items, committedAt: 1 }
     },
     readFailure: (sessionId) => {
       const row = world.failures.get(sessionId)
@@ -102,9 +108,16 @@ function makeWorld(initial: FakeState = {}): FakeWorld {
     deleteFailure: (sessionId) => {
       world.failures.delete(sessionId)
     },
+    readGaps: () => [...world.gaps.values()],
+    writeGap: (entry) => {
+      world.gaps.set(entry.id, { ...entry, sightings: entry.sightings.map(sighting => ({ ...sighting })) })
+    },
+    deleteGap: (id) => {
+      world.gaps.delete(id)
+    },
     commitItems: ({ sessionId, items }) => {
       world.committed.push({ sessionId, items })
-      return { committed: items.map(item => item.content) }
+      return { results: items.map(item => ({ content: item.content, outcome: 'committed' as const })) }
     },
     generate: ({ stage, prompt }) => {
       world.generateCalls.push({ stage, prompt })
@@ -117,6 +130,21 @@ function makeWorld(initial: FakeState = {}): FakeWorld {
     now: () => 42,
   }
   return world
+}
+
+function gapEntry(overrides: Partial<MemoryExtractionGapEntry> & { readonly id: string }): MemoryExtractionGapEntry {
+  return {
+    content: 'durable fact',
+    sightings: [],
+    covered: false,
+    updatedAt: 1,
+    ...overrides,
+  }
+}
+
+/** Build the fixed engine the E1 tests drive. */
+function makeEngine(world: FakeWorld, options: MemoryExtractionEngineOptions = {}): MemoryExtractionEngine {
+  return new MemoryExtractionEngine(world.ports, options)
 }
 
 function happyProposal(stage: string): string {
@@ -132,7 +160,7 @@ function happyProposal(stage: string): string {
 describe('MemoryExtractionEngine', () => {
   it('extracts admitted items: proposal, canonicalization, commit, cursor, receipt', async () => {
     const world = makeWorld({ events: [userEntry(1, 'durable fact')] })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 1 }))
 
     expect(result).toEqual({ status: 'extracted', items: ['durable fact'] })
@@ -146,7 +174,7 @@ describe('MemoryExtractionEngine', () => {
 
   it('is idempotent by deterministic operation id (no second model run)', async () => {
     const world = makeWorld({ events: [userEntry(1, 'durable fact')] })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const first = await engine.execute(snapshot({ boundarySeq: 1 }))
     const second = await engine.execute(snapshot({ boundarySeq: 1 }))
 
@@ -158,7 +186,7 @@ describe('MemoryExtractionEngine', () => {
 
   it('advances the cursor for an empty range without any model call', async () => {
     const world = makeWorld({ events: [] })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 0 }))
 
     expect(result).toEqual({ status: 'skipped' })
@@ -169,7 +197,7 @@ describe('MemoryExtractionEngine', () => {
 
   it('skips a range whose events carry no user evidence (no model call)', async () => {
     const world = makeWorld({ events: [otherEntry(1), { seq: 2, event: textEvent(2, 'assistant', 'model', 'reply') }] })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 2 }))
 
     expect(result).toEqual({ status: 'skipped' })
@@ -182,7 +210,7 @@ describe('MemoryExtractionEngine', () => {
       events: [userEntry(1, 'durable fact')],
       gate: () => ({ allowed: false, reason: 'ineligible' }),
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 1, origin: 'subagent' }))
 
     expect(result).toEqual({ status: 'unavailable', reason: 'gate: ineligible' })
@@ -197,7 +225,7 @@ describe('MemoryExtractionEngine', () => {
         ? { ok: true, text: '{"status":"complete","incidents":[{"content":"hallucinated","evidence":[{"sourceRef":"event:1","quote":"never said"}]}]}' }
         : { ok: true, text: happyProposal(stage) },
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 1 }))
 
     expect(result).toEqual({ status: 'skipped' })
@@ -211,7 +239,7 @@ describe('MemoryExtractionEngine', () => {
       events,
       generate: () => ({ ok: false, errorClass: 'provider' }),
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
 
     const first = await engine.execute(snapshot({ boundarySeq: 1 }))
     expect(first.status).toBe('unavailable')
@@ -243,7 +271,7 @@ describe('MemoryExtractionEngine', () => {
         return { ok: true, text: happyProposal(stage) }
       },
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
 
     const first = await engine.execute(snapshot({ boundarySeq: 1 }))
     expect(first.status).toBe('unavailable')
@@ -264,7 +292,7 @@ describe('MemoryExtractionEngine', () => {
         ? { ok: true, text: 'malformed canonical' }
         : { ok: true, text: happyProposal(stage) },
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = new MemoryExtractionEngine(world.ports, { minGapEvidence: 1 })
     const result = await engine.execute(snapshot({ boundarySeq: 1 }))
 
     expect(result.status).toBe('unavailable')
@@ -280,12 +308,157 @@ describe('MemoryExtractionEngine', () => {
       sessionId: 's1', fromSeq: 1, throughSeq: 1, coverageHash: 'x',
       operationId: 'op', attempts: 1, failureClass: 'provider', failedAt: 1,
     })
-    const engine = new MemoryExtractionEngine(world.ports)
+    const engine = makeEngine(world)
     const result = await engine.execute(snapshot({ boundarySeq: 2 }))
 
     expect(result.status).toBe('skipped')
     expect(world.failures.has('s1')).toBe(false)
     expect(world.cursor.get('s1')?.processedSeq).toBe(2)
     expect(world.generateCalls).toHaveLength(0)
+  })
+})
+
+describe('MemoryExtractionEngine evidence floor (E1)', () => {
+  const gapId = memoryGapIdForContent('durable fact') ?? 'gap_unexpected'
+
+  it('defers an uncorroborated fact by default (floor 2): no commit, one sighting, pending receipt', async () => {
+    const world = makeWorld({ events: [userEntry(1, 'durable fact')] })
+    const engine = makeEngine(world) // no options → DEFAULT_MIN_GAP_EVIDENCE (2)
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'pending', pending: 1 })
+    expect(world.committed).toHaveLength(0)
+    expect(world.cursor.get('s1')?.processedSeq).toBe(1)
+    expect([...world.receipts.values()][0]?.status).toBe('pending')
+    expect(world.gaps.get(gapId)).toMatchObject({
+      content: 'durable fact',
+      covered: false,
+      sightings: [{ sessionId: 's1', at: 42 }],
+    })
+  })
+
+  it('commits a fact once a SECOND distinct session corroborates it (same content hash)', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'durable fact')],
+      gaps: [gapEntry({ id: gapId, content: 'durable fact', sightings: [{ sessionId: 's-other', at: 41 }], updatedAt: 41 })],
+    })
+    const engine = makeEngine(world)
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'extracted', items: ['durable fact'] })
+    expect(world.committed).toHaveLength(1)
+    expect(world.gaps.get(gapId)).toMatchObject({
+      covered: true,
+      sightings: [
+        { sessionId: 's-other', at: 41 },
+        { sessionId: 's1', at: 42 },
+      ],
+    })
+  })
+
+  it('treats the same session twice as one sighting (never counts twice)', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'durable fact')],
+      gaps: [gapEntry({ id: gapId, content: 'durable fact', sightings: [{ sessionId: 's1', at: 41 }], updatedAt: 41 })],
+    })
+    const engine = makeEngine(world)
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'pending', pending: 1 })
+    expect(world.committed).toHaveLength(0)
+    expect(world.gaps.get(gapId)?.sightings).toHaveLength(1)
+  })
+
+  it('lets the model bridge a paraphrase by citing the open gap id', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'the build needs pnpm')],
+      gaps: [gapEntry({ id: 'gap_seeded', content: 'use pnpm for the build', sightings: [{ sessionId: 's-other', at: 41 }], updatedAt: 41 })],
+      generate: stage => {
+        if (stage === 'proposal') {
+          return {
+            ok: true,
+            text: '{"status":"complete","incidents":[{"content":"the build needs pnpm","evidence":[{"sourceRef":"event:1","quote":"the build needs pnpm"}],"gapId":"gap_seeded"}]}',
+          }
+        }
+        return { ok: true, text: '{"results":[{"candidateId":"candidate_0","status":"accepted","content":"the build needs pnpm"}]}' }
+      },
+    })
+    const engine = makeEngine(world)
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'extracted', items: ['the build needs pnpm'] })
+    expect(world.gaps.get('gap_seeded')).toMatchObject({ covered: true })
+  })
+
+  it('records no gap rows and commits immediately when minGapEvidence is 0 (pre-E1 behavior)', async () => {
+    const world = makeWorld({ events: [userEntry(1, 'durable fact')] })
+    const engine = makeEngine(world, { minGapEvidence: 0 })
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'extracted', items: ['durable fact'] })
+    expect(world.gaps.size).toBe(0)
+    expect(world.generateCalls[0]?.prompt).not.toContain('<open_pending_facts>')
+  })
+
+  it('commits on the first sighting but tracks the covered row when minGapEvidence is 1', async () => {
+    const world = makeWorld({ events: [userEntry(1, 'durable fact')] })
+    const engine = makeEngine(world, { minGapEvidence: 1 })
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'extracted', items: ['durable fact'] })
+    expect(world.gaps.get(gapId)).toMatchObject({ covered: true, sightings: [{ sessionId: 's1', at: 42 }] })
+  })
+
+  it('ignores sightings older than gapLedgerMaxAgeMs (and revives the entry on a fresh sighting)', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'durable fact')],
+      gaps: [gapEntry({ id: gapId, content: 'durable fact', sightings: [{ sessionId: 's-other', at: 1 }], updatedAt: 1 })],
+    })
+    const engine = makeEngine(world, { gapLedgerMaxAgeMs: 10 }) // now()=42 → sighting at 1 is stale
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'pending', pending: 1 })
+    expect(world.committed).toHaveLength(0)
+    const entry = world.gaps.get(gapId)
+    expect(entry?.sightings).toEqual([{ sessionId: 's1', at: 42 }]) // stale one expired, fresh one kept
+    expect(entry?.covered).toBe(false)
+  })
+
+  it('shows open pending facts to the proposal stage (capped, most recent first)', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'durable fact')],
+      gaps: [
+        gapEntry({ id: 'gap_older', content: 'older pending', sightings: [{ sessionId: 's-a', at: 40 }], updatedAt: 40 }),
+        gapEntry({ id: 'gap_newer', content: 'newer pending', sightings: [{ sessionId: 's-b', at: 41 }], updatedAt: 41 }),
+      ],
+    })
+    const engine = makeEngine(world)
+    await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    const prompt = world.generateCalls[0]?.prompt ?? ''
+    expect(prompt).toContain('<open_pending_facts>')
+    expect(prompt.indexOf('gap_newer')).toBeLessThan(prompt.indexOf('gap_older'))
+    expect(prompt).toContain('"sessions":1')
+  })
+
+  it('marks a gap covered (not committed) when the bank already holds the fact', async () => {
+    const world = makeWorld({
+      events: [userEntry(1, 'durable fact')],
+      gaps: [gapEntry({ id: gapId, content: 'durable fact', sightings: [{ sessionId: 's-other', at: 41 }], updatedAt: 41 })],
+    })
+    const ports = new Proxy(world.ports, {
+      get(target, property, receiver) {
+        if (property === 'commitItems') {
+          return () => ({ results: [{ content: 'durable fact', outcome: 'duplicate' }] })
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    }) as MemoryExtractionPorts
+    const engine = new MemoryExtractionEngine(ports)
+    const result = await engine.execute(snapshot({ boundarySeq: 1 }))
+
+    expect(result).toEqual({ status: 'skipped' }) // nothing newly committed
+    expect(world.committed).toHaveLength(0)
+    expect(world.gaps.get(gapId)).toMatchObject({ covered: true })
   })
 })

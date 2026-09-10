@@ -1,5 +1,5 @@
 ---
-description: "Automatic long-term-memory extraction at compaction checkpoints: evidence projection, proposal/canonicalization pipeline, gated ctx.memory commit, and durable cursors/receipts/failure ledger (Maka port, slice No. 2)."
+description: "Automatic long-term-memory extraction at compaction checkpoints: evidence projection, proposal/canonicalization pipeline, gated ctx.memory commit, durable cursors/receipts/failure ledger, and a cross-session evidence floor (Maka port, slice No. 2)."
 kind: "package-reference"
 ---
 
@@ -46,6 +46,16 @@ per-session serialized and never block the compaction listener.
    commit-side dedupe probe heals a crash between items and receipt.
 5. **Subagents are excluded** — the gate re-checks after every model call and
    rejects child sessions by default (`excludeSubagents: true`).
+6. **Cross-session evidence floor (E1)** — a fact only commits once
+   `minGapEvidence` **distinct** sessions (default 2; one session never counts
+   twice, even across its own compactions) have proposed the same durable fact.
+   Uncorroborated facts become `gaps` sighted in the ledger, shown to later
+   proposal passes as open pending facts (the model cites a `gapId` instead of
+   coining a paraphrase); identity falls back to the normalized content hash.
+   A fact retires (covered) when it commits or is found already in the bank.
+   Sightings older than `gapLedgerMaxAgeMs` (default 90 d) expire. Deferrals
+   still advance the cursor and settle the receipt; reads/writes of the ledger
+   take a config value of `0` off entirely (pre-E1 behavior).
 
 ## Table of Contents
 
@@ -74,6 +84,8 @@ every session's events. There is no agent-preset contribution and no tool.
     importance: 0.5           # bank importance for auto-extracted facts (default 0.5)
     dedupe: true              # probe the bank before committing duplicates (default true)
     timeoutMs: 60000          # auxiliary call timeout (default 60000)
+    minGapEvidence: 2         # distinct sessions before a fact commits (default 2; 0 disables the floor)
+    gapLedgerMaxAgeMs: 7776000000   # sightings older than this stop counting (default 90 d in ms)
 ```
 
 Its storage backend must expose a `kv` facet (the shipped `sqlite` backend
@@ -92,7 +104,10 @@ const result = await engine.execute(snapshot)   // never throws; idempotent by o
 
 The plugin boots asynchronously: an effect opens the control unit via
 `storage.backend.<backend>.kv.open(MemoryExtractionControlStore.descriptor)`
-(`memory_extraction`, version 1, tables `cursors`/`receipts`/`failures`) and
+(`memory_extraction`, version 1, tables `cursors`/`receipts`/`failures`/`gaps`
+— the gap table is additive and the version stays 1 because the storage-sqlite
+backend rejects version bumps on existing media; `CREATE TABLE IF NOT EXISTS`
+materializes it on upgrade) and
 registers the `session/event` listener. A missing backend logs and leaves the
 plugin inert instead of failing composition.
 
@@ -105,7 +120,7 @@ plugin inert instead of failing composition.
   `search_required` / `cannot_resolve` / canonicalization), prompt builders that
   frame evidence as **untrusted data**, admission (verbatim quotes, min 4 chars,
   secret rejection, NFC + injection neutralization, 2 000-char content cap).
-- `src/control.ts` — the durable cursor/receipt/failure store over one
+- `src/control.ts` — the durable cursor/receipt/failure/gap store over one
   `KvUnit` (single write chain; heal-on-open; write ordering documented).
 - `src/engine.ts` — the state machine: idempotency receipt, gate, empty-range
   advance, one-retry-then-discard, 3-call budget, commit ordering.
@@ -140,6 +155,13 @@ the bounded, user-authored evidence plus a short localization context.
   retry.
 - **No persistent re-extraction** on evidence growth: a checkpoint that failed
   is retried once and then dropped.
+- **Gap identity is model-cited or exact-hash** — a paraphrase the proposal
+  pass does not link to an open pending fact via `gapId` falls back to the
+  normalized content hash and stays pending until a byte-identical sighting (or
+  an explicit cite) corroborates it. No lexical/semantic matching is done.
+- **Deferred facts are not dedupe-probed** — a fact someone already
+  `retain`ed that the extraction proposes never retires via the bank check; it
+  retires when a second session cites it or its sighting expires.
 - **Maka facets are not ported** (kind/temporal/scope/tags); every extracted
   fact lands with `source: 'memory_extract'` and the configured importance.
 - **No per-verb tools**: `memory_remember`/`memory_extract` are reserved names;

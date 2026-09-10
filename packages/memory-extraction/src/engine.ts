@@ -32,16 +32,20 @@ import {
   buildLocalizedMemoryProposalPrompt,
   buildMemoryCanonicalizationPrompt,
   deterministicMemoryPolicyRejection,
+  MAX_GAP_PROMPT_ENTRIES,
+  normalizeProposedMemoryText,
   parseLocalizedMemoryProposal,
   parseMemoryCanonicalization,
   parseMemoryProposal,
 } from './proposal.ts'
+import type { MemoryExtractionGapPromptEntry } from './proposal.ts'
 import type {
   AdmittedMemoryItem,
   MemoryCoveragePlan,
   MemoryExtractionCursor,
   MemoryExtractionEventEntry,
   MemoryExtractionFailureClass,
+  MemoryExtractionGapEntry,
   MemoryExtractionGate,
   MemoryExtractionReceipt,
   MemoryExtractionRunResult,
@@ -77,6 +81,12 @@ export interface MemoryExtractionPorts {
   writeReceipt(receipt: MemoryExtractionReceipt): void | Promise<void>
   writeFailure(failure: PendingMemoryExtractionFailure): void | Promise<void>
   deleteFailure(sessionId: string): void | Promise<void>
+  /** Read every gap-ledger entry (open and covered); the engine applies floor/expiry math. */
+  readGaps(): readonly MemoryExtractionGapEntry[] | Promise<readonly MemoryExtractionGapEntry[]>
+  /** Upsert one gap-ledger entry. */
+  writeGap(entry: MemoryExtractionGapEntry): void | Promise<void>
+  /** Delete one gap-ledger entry (expiry purge). */
+  deleteGap(id: string): void | Promise<void>
   /** Commit admitted items into the project memory store; returns what was actually stored. */
   commitItems(input: {
     readonly sessionId: string
@@ -84,7 +94,11 @@ export interface MemoryExtractionPorts {
     readonly trigger: MemoryExtractionSourceSnapshot['trigger']
     readonly boundarySeq: number
     readonly items: readonly AdmittedMemoryItem[]
-  }): { readonly committed: readonly string[] } | Promise<{ readonly committed: readonly string[] }>
+  }): {
+    readonly results: readonly { readonly content: string; readonly outcome: 'committed' | 'duplicate' | 'dropped' }[]
+  } | Promise<{
+    readonly results: readonly { readonly content: string; readonly outcome: 'committed' | 'duplicate' | 'dropped' }[]
+  }>
   /** One bounded auxiliary model call. Implementations own the timeout signal. */
   generate(input: {
     readonly snapshot: MemoryExtractionSourceSnapshot
@@ -94,13 +108,33 @@ export interface MemoryExtractionPorts {
   now?(): number
 }
 
+/**
+ * Engine options (config-derived). The evidence floor is opt-in per value:
+ * `minGapEvidence` 0 disables the ledger entirely (pre-E1 behavior); 1 admits
+ * on the first sighting while still recording; 2+ (default) requires that many
+ * distinct sessions.
+ */
+export interface MemoryExtractionEngineOptions {
+  /** Distinct sessions a fact needs before it commits (default 2; 0 disables the floor). */
+  readonly minGapEvidence?: number
+  /** Gap sightings older than this expire and stop counting (default 90 days). */
+  readonly gapLedgerMaxAgeMs?: number
+}
+
 /** Max auxiliary model calls per range (Maka: 3). */
 export const MAX_MEMORY_EXTRACTION_MODEL_CALLS = 3
 /** One later retry after a settled failure, then discard (Maka keeps more states). */
 export const MAX_FAILURE_ATTEMPTS = 2
+/** Distinct sessions a fact needs before committing (backpass `minGapEvidence` default). */
+export const DEFAULT_MIN_GAP_EVIDENCE = 2
+/** Gap sightings older than this stop counting (backpass `gapLedgerMaxAge` default). */
+export const DEFAULT_GAP_LEDGER_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000
+/** Content-hash identity: `gap_` + 24 hex chars of the normalized content's sha256. */
+export const GAP_CONTENT_HASH_HEX = 24
 
 type CoverageResult =
   | { readonly kind: 'committed'; readonly committed: readonly string[] }
+  | { readonly kind: 'pending'; readonly pending: number }
   | {
     readonly kind: 'counted_failure'
     readonly failureClass: MemoryExtractionFailureClass
@@ -111,8 +145,17 @@ interface ModelBudget {
   remaining: number
 }
 
+/** One write candidate carrying its cross-session gap association. */
+interface GatedWrite {
+  readonly item: AdmittedMemoryItem
+  readonly gapId?: string
+}
+
 export class MemoryExtractionEngine {
-  constructor(private readonly ports: MemoryExtractionPorts) { }
+  constructor(
+    private readonly ports: MemoryExtractionPorts,
+    private readonly options: MemoryExtractionEngineOptions = {},
+  ) { }
 
   async execute(snapshot: MemoryExtractionSourceSnapshot): Promise<MemoryExtractionRunResult> {
     if (!validSnapshot(snapshot)) return { status: 'unavailable', reason: 'invalid snapshot' }
@@ -158,6 +201,10 @@ export class MemoryExtractionEngine {
           ? { status: 'extracted', items: retried.committed }
           : { status: 'skipped' }
       }
+      if (retried.kind === 'pending') {
+        await this.ports.deleteFailure(snapshot.sessionId)
+        return { status: 'pending', pending: retried.pending }
+      }
       if (retried.kind === 'blocked') {
         return { status: 'unavailable', reason: 'blocked' }
       }
@@ -186,6 +233,7 @@ export class MemoryExtractionEngine {
         ? { status: 'extracted', items: processed.committed }
         : { status: 'skipped' }
     }
+    if (processed.kind === 'pending') return { status: 'pending', pending: processed.pending }
     if (processed.kind === 'blocked') return { status: 'unavailable', reason: 'blocked' }
     const settled = await this.settleCountedFailure({
       snapshot,
@@ -259,13 +307,21 @@ export class MemoryExtractionEngine {
   }): Promise<CoverageResult> {
     const { coverage, budget } = input
 
+    // E1: load the cross-session gap ledger once per range (open pending facts
+    // for the proposal prompt + the identity index for the evidence floor).
+    const gap = await this.loadGapIndex(input.now, this.gapMaxAge())
+
     // Stage 1: proposal over the bounded evidence.
     let proposals: readonly MemoryProposalItem[] | undefined
     let localizedEvidence: MemoryCoveragePlan['evidence'] | undefined
     let interpretationContext: string | undefined
     const stageOne = await this.callModel(
       input.snapshot,
-      buildFirstMemoryProposalPrompt({ now: input.now, evidence: coverage.evidence }),
+      buildFirstMemoryProposalPrompt({
+        now: input.now,
+        evidence: coverage.evidence,
+        ...gap.prompt.length > 0 ? { openGaps: gap.prompt } : {},
+      }),
       'proposal',
       budget,
     )
@@ -295,6 +351,7 @@ export class MemoryExtractionEngine {
           now: input.now,
           evidence: fitted,
           interpretationContext,
+          ...gap.prompt.length > 0 ? { openGaps: gap.prompt } : {},
         }),
         'localized',
         budget,
@@ -318,6 +375,7 @@ export class MemoryExtractionEngine {
       readonly candidateId: string
       readonly item: MemoryProposalItem
       readonly admitted: AdmittedMemoryItem
+      readonly gapId?: string
     }> = []
     for (const proposal of proposals) {
       if (deterministicMemoryPolicyRejection(proposal)) continue
@@ -327,6 +385,7 @@ export class MemoryExtractionEngine {
         candidateId: `candidate_${candidates.length}`,
         item: proposal,
         admitted,
+        ...proposal.gapId !== undefined ? { gapId: proposal.gapId } : {},
       })
     }
     if (candidates.length === 0) {
@@ -335,7 +394,7 @@ export class MemoryExtractionEngine {
     }
 
     // Stage 2: canonicalization, then re-admission against the same evidence.
-    const writes: AdmittedMemoryItem[] = []
+    const writes: GatedWrite[] = []
     const canonicalPrompt = buildMemoryCanonicalizationPrompt({
       now: input.now,
       candidates: candidates.map(candidate => ({
@@ -404,7 +463,10 @@ export class MemoryExtractionEngine {
       if (deterministicMemoryPolicyRejection(canonicalProposal)) continue
       const admitted = admitMemoryProposalItem(canonicalProposal, evidenceMap)
       if (admitted === undefined) continue
-      writes.push(admitted)
+      writes.push({
+        item: admitted,
+        ...candidate.gapId !== undefined ? { gapId: candidate.gapId } : {},
+      })
     }
 
     if (writes.length === 0) {
@@ -413,8 +475,43 @@ export class MemoryExtractionEngine {
     }
     if (!(await this.allowed(input.snapshot))) return { kind: 'blocked' }
 
+    // E1 evidence floor: only writes corroborated by enough distinct sessions
+    // commit; the rest become gap sightings awaiting another session.
+    const gated = await this.gateWrites({
+      sessionId: input.snapshot.sessionId,
+      now: input.now,
+      minGapEvidence: this.minGapEvidence(),
+      maxAgeMs: this.gapMaxAge(),
+      index: gap.entries,
+      writes,
+    })
+    // Persist uncorroborated sightings first: they are the ledger and must
+    // survive a crash before the cursor/receipt write chain below.
+    for (const entry of gated.dirty.values()) {
+      if (!entry.covered) await this.ports.writeGap(entry)
+    }
+    if (gated.eligible.length === 0) {
+      await this.ports.writeCursor({
+        sessionId: input.snapshot.sessionId,
+        processedSeq: input.throughSeq,
+        updatedAt: this.now(),
+      })
+      await this.ports.writeReceipt({
+        operationId: input.operationId,
+        sessionId: input.snapshot.sessionId,
+        status: 'pending',
+        items: [],
+        committedAt: this.now(),
+      })
+      // Purge only entries that stayed expired — a revived one was just written above.
+      for (const id of gap.expired.filter(id => !gated.dirty.has(id))) await this.ports.deleteGap(id)
+      return { kind: 'pending', pending: gated.deferred }
+    }
+
     // Commit order: items first (dedupe is the cross-store idempotency
-    // backstop), then cursor, then receipt.
+    // backstop), then cursor, then receipt. Gap-covered marks follow — a crash
+    // between them only leaves a stale open entry, which the bank dedupe heals
+    // on the next corroboration.
     const committed = await this.ports.commitItems({
       sessionId: input.snapshot.sessionId,
       ...input.snapshot.workspaceKey !== undefined
@@ -422,8 +519,21 @@ export class MemoryExtractionEngine {
         : {},
       trigger: input.snapshot.trigger,
       boundarySeq: input.throughSeq,
-      items: writes,
+      items: gated.eligible.map(write => write.item),
     })
+    const committedContents: string[] = []
+    for (const result of committed.results) {
+      if (result.outcome !== 'committed') continue
+      committedContents.push(result.content)
+    }
+    for (const result of committed.results) {
+      if (result.outcome === 'dropped') continue
+      const id = gated.idsByContent.get(result.content)
+      if (id === undefined) continue
+      await this.ports.writeGap(
+        this.coveredGapEntry(id, result.content, gated.dirty.get(id) ?? gap.entries.get(id), input.snapshot.sessionId, input.now),
+      )
+    }
     await this.ports.writeCursor({
       sessionId: input.snapshot.sessionId,
       processedSeq: input.throughSeq,
@@ -433,10 +543,11 @@ export class MemoryExtractionEngine {
       operationId: input.operationId,
       sessionId: input.snapshot.sessionId,
       status: 'extracted',
-      items: [...committed.committed],
+      items: [...committedContents],
       committedAt: this.now(),
     })
-    return { kind: 'committed', committed: committed.committed }
+    for (const id of gap.expired.filter(id => !gated.dirty.has(id))) await this.ports.deleteGap(id)
+    return { kind: 'committed', committed: committedContents }
   }
 
   private async commitEmpty(
@@ -499,6 +610,151 @@ export class MemoryExtractionEngine {
     return 'retry_later'
   }
 
+  /* ── cross-session evidence floor (E1) ─────────────────────────────────── */
+
+  private minGapEvidence(): number {
+    return this.options.minGapEvidence ?? DEFAULT_MIN_GAP_EVIDENCE
+  }
+
+  private gapMaxAge(): number {
+    return this.options.gapLedgerMaxAgeMs ?? DEFAULT_GAP_LEDGER_MAX_AGE_MS
+  }
+
+  /**
+   * Load the whole gap ledger once per range: the identity index (for the
+   * floor gate) plus the open, uncorroborated, non-expired entries for the
+   * proposal prompt (most recently sighted first, capped). Disabled floor →
+   * empty index (no reads at all).
+   */
+  private async loadGapIndex(now: number, maxAgeMs: number): Promise<{
+    readonly entries: ReadonlyMap<string, MemoryExtractionGapEntry>
+    readonly prompt: readonly MemoryExtractionGapPromptEntry[]
+    readonly expired: readonly string[]
+  }> {
+    if (this.minGapEvidence() <= 0) return { entries: new Map(), prompt: [], expired: [] }
+    const all = await this.ports.readGaps()
+    const entries = new Map<string, MemoryExtractionGapEntry>()
+    const open: Array<{ readonly entry: MemoryExtractionGapEntry; readonly freshCount: number }> = []
+    const expired: string[] = []
+    for (const entry of all) {
+      entries.set(entry.id, entry)
+      if (entry.covered) continue
+      const fresh = entry.sightings.filter(sighting => now - sighting.at <= maxAgeMs)
+      if (fresh.length === 0) {
+        expired.push(entry.id)
+        continue
+      }
+      open.push({ entry, freshCount: distinctSessionIds(fresh) })
+    }
+    open.sort((left, right) => right.entry.updatedAt - left.entry.updatedAt)
+    const prompt = open
+      .slice(0, MAX_GAP_PROMPT_ENTRIES)
+      .map(item => ({ id: item.entry.id, content: item.entry.content, sessions: item.freshCount }))
+    return { entries, prompt, expired }
+  }
+
+  /**
+   * Apply the evidence floor to the final writes: a write commits only when
+   * `minGapEvidence` DISTINCT sessions (fresh sightings plus this one, counted
+   * once per session) have proposed the same gap identity; otherwise it is
+   * recorded as a new sighting and deferred. `minGapEvidence <= 0` is the
+   * pre-E1 path: everything commits, nothing is tracked.
+   */
+  private async gateWrites(input: {
+    readonly sessionId: string
+    readonly now: number
+    readonly minGapEvidence: number
+    readonly maxAgeMs: number
+    readonly index: ReadonlyMap<string, MemoryExtractionGapEntry>
+    readonly writes: readonly GatedWrite[]
+  }): Promise<{
+    readonly eligible: readonly GatedWrite[]
+    readonly deferred: number
+    readonly dirty: ReadonlyMap<string, MemoryExtractionGapEntry>
+    readonly idsByContent: ReadonlyMap<string, string>
+  }> {
+    if (input.minGapEvidence <= 0) {
+      return { eligible: [...input.writes], deferred: 0, dirty: new Map(), idsByContent: new Map() }
+    }
+    const eligible: GatedWrite[] = []
+    const dirty = new Map<string, MemoryExtractionGapEntry>()
+    const idsByContent = new Map<string, string>()
+    let deferred = 0
+    for (const write of input.writes) {
+      const id = write.gapId ?? memoryGapIdForContent(write.item.content)
+      if (id === undefined) {
+        eligible.push(write)
+        continue
+      }
+      idsByContent.set(write.item.content, id)
+      const existing = input.index.get(id)
+      if (existing?.covered === true) {
+        // Already settled (committed or bank-covered): the commit/dedupe path
+        // is the right one and the entry stays retired.
+        eligible.push(write)
+        continue
+      }
+      const fresh = existing?.sightings.filter(sighting => input.now - sighting.at <= input.maxAgeMs) ?? []
+      const seenHere = fresh.some(sighting => sighting.sessionId === input.sessionId)
+      const count = distinctSessionIds(fresh) + (seenHere ? 0 : 1)
+      if (count < input.minGapEvidence) {
+        deferred += 1
+        dirty.set(id, {
+          id,
+          content: write.item.content,
+          sightings: seenHere ? fresh : [...fresh, { sessionId: input.sessionId, at: input.now }],
+          covered: false,
+          updatedAt: input.now,
+        })
+        continue
+      }
+      eligible.push(write)
+      if (existing !== undefined) {
+        dirty.set(id, {
+          ...existing,
+          content: write.item.content,
+          sightings: seenHere
+            ? existing.sightings
+            : [...existing.sightings, { sessionId: input.sessionId, at: input.now }],
+          covered: true,
+          coveredAt: input.now,
+          updatedAt: input.now,
+        })
+      } else {
+        // First sighting already satisfies the floor (minGapEvidence 1): record as covered.
+        dirty.set(id, {
+          id,
+          content: write.item.content,
+          sightings: [{ sessionId: input.sessionId, at: input.now }],
+          covered: true,
+          coveredAt: input.now,
+          updatedAt: input.now,
+        })
+      }
+    }
+    return { eligible, deferred, dirty, idsByContent }
+  }
+
+  /** Mark one gap entry covered (committed or found already in the bank). */
+  private coveredGapEntry(
+    id: string,
+    content: string,
+    existing: MemoryExtractionGapEntry | undefined,
+    sessionId: string,
+    now: number,
+  ): MemoryExtractionGapEntry {
+    const sightings = existing?.sightings ?? []
+    const seenHere = sightings.some(sighting => sighting.sessionId === sessionId)
+    return {
+      id,
+      content,
+      sightings: seenHere ? sightings : [...sightings, { sessionId, at: now }],
+      covered: true,
+      coveredAt: now,
+      updatedAt: now,
+    }
+  }
+
   private async callModel(
     snapshot: MemoryExtractionSourceSnapshot,
     prompt: string,
@@ -554,6 +810,22 @@ export function memoryCoverageHash(
         .map(entry => [entry.seq, `${entry.event.role}:${entry.event.author}:${entry.event.text?.length ?? 0}`]),
     ))
     .digest('hex')
+}
+
+/**
+ * Content-hash gap identity fallback (used when the proposal cited no gapId):
+ * `gap_` + the first 24 hex chars of the normalized content's sha256, so two
+ * sessions proposing byte-identical normalized facts land on one ledger entry.
+ */
+export function memoryGapIdForContent(content: string): string | undefined {
+  const normalized = normalizeProposedMemoryText(content)
+  if (normalized === undefined) return undefined
+  return `gap_${createHash('sha256').update(normalized).digest('hex').slice(0, GAP_CONTENT_HASH_HEX)}`
+}
+
+/** Distinct session ids among sightings (a session never counts twice). */
+function distinctSessionIds(sightings: readonly { readonly sessionId: string }[]): number {
+  return new Set(sightings.map(sighting => sighting.sessionId)).size
 }
 
 function validSnapshot(snapshot: MemoryExtractionSourceSnapshot): boolean {

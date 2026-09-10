@@ -51,6 +51,30 @@ describe('parseMemoryProposal', () => {
     expect(parseMemoryProposal('{"status":"complete","incidents":[{"content":"x","evidence":[]}]}')).toBeUndefined()
     expect(parseMemoryProposal('not json')).toBeUndefined()
   })
+
+  it('parses an optional gap-id citation and fails closed on malformed ids', () => {
+    const parsed = parseMemoryProposal(
+      '{"status":"complete","incidents":[{"content":"the build needs pnpm","evidence":[{"sourceRef":"event:1","quote":"pnpm"}],"gapId":"gap_abc123"}]}',
+    )
+    expect(parsed).toEqual({
+      status: 'complete',
+      incidents: [{
+        content: 'the build needs pnpm',
+        evidence: [{ sourceRef: 'event:1', quote: 'pnpm' }],
+        gapId: 'gap_abc123',
+      }],
+    })
+    // Only engine-shaped ids: no leading gap_, spaces, or non-alphanumerics.
+    expect(parseMemoryProposal(
+      '{"status":"complete","incidents":[{"content":"x","evidence":[{"sourceRef":"event:1","quote":"x"}],"gapId":"whatever"}]}',
+    )).toBeUndefined()
+    expect(parseMemoryProposal(
+      '{"status":"complete","incidents":[{"content":"x","evidence":[{"sourceRef":"event:1","quote":"x"}],"gapId":"GAP_ABC"}]}',
+    )).toBeUndefined()
+    expect(parseMemoryProposal(
+      '{"status":"complete","incidents":[{"content":"x","evidence":[{"sourceRef":"event:1","quote":"x"}],"gapId":42}]}',
+    )).toBeUndefined()
+  })
 })
 
 describe('parseLocalizedMemoryProposal', () => {
@@ -130,6 +154,21 @@ describe('prompts', () => {
     expect(prompt).toContain('untrusted data')
     expect(prompt).toContain('"sourceRef":"event:1"')
     expect(prompt).toContain('a durable preference')
+  })
+
+  it('embeds open pending facts (with ids and session counts) only when provided', () => {
+    const evidence = evidenceFrom('a durable preference')
+    const withGaps = buildFirstMemoryProposalPrompt({
+      now: 1_700_000_000_000,
+      evidence: [...evidence.values()],
+      openGaps: [{ id: 'gap_seeded', content: 'a pending fact', sessions: 2 }],
+    })
+    expect(withGaps).toContain('<open_pending_facts>')
+    expect(withGaps).toContain('gap_seeded')
+    expect(withGaps).toContain('"sessions":2')
+
+    const withoutGaps = buildFirstMemoryProposalPrompt({ now: 1_700_000_000_000, evidence: [...evidence.values()] })
+    expect(withoutGaps).not.toContain('<open_pending_facts>')
   })
 
   it('canonicalization prompt carries candidate ids for exact result mapping', () => {

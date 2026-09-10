@@ -1,6 +1,6 @@
 # dsh-memory-extraction
 
-Standalone package: @hy-sde-org/dsh-memory-extraction — automatic long-term-memory extraction at compaction (evidence-grounding, proposal/admission/canonicalization, per-session cursors) for the DeepSeek Harness.
+Standalone package: @hy-sde-org/dsh-memory-extraction — automatic long-term-memory extraction at compaction (evidence-grounding, proposal/admission/canonicalization, per-session cursors, cross-session evidence floor) for the DeepSeek Harness.
 
 ## Packages
 

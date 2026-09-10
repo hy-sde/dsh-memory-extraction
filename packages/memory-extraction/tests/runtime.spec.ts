@@ -78,7 +78,7 @@ describe('MemoryExtractionRuntime', () => {
       llm,
     } as unknown as Context
 
-    const runtime = new MemoryExtractionRuntime(ctx, {}, control, memory)
+    const runtime = new MemoryExtractionRuntime(ctx, { minGapEvidence: 1 }, control, memory)
     runtime.attach()
 
     expect(listener).toHaveLength(1)
@@ -95,6 +95,71 @@ describe('MemoryExtractionRuntime', () => {
     expect(saves[0]).toMatchObject({ content: 'durable fact', source: 'memory_extract', importance: 0.5 })
     expect(captures).toHaveLength(2) // proposal + canonicalization
     expect(captures[0]).toMatchObject({ provider: 'test-provider', model: 'test-model' })
+    expect(await control.readCursor('s1')).toMatchObject({ processedSeq: 1 })
+    const gapRows = await control.readGaps()
+    expect(gapRows).toHaveLength(1)
+    expect(gapRows[0]).toMatchObject({ content: 'durable fact', covered: true })
+    await unit.close()
+    await backend.close()
+  })
+
+  it('defers an uncorroborated fact under the default floor (gap row through the real control unit, no save)', async () => {
+    const events: SessionEvent[] = [userMessage(1, 'durable fact')]
+    const session = {
+      id: SessionId('s1'),
+      header: { cwd: '/tmp/proj', origin: 'user' },
+      requestHeader: () => ({ config: { provider: 'test-provider', model: 'test-model' } }),
+      snapshotEvents: (from: number, to: number) => events.filter(event => event.seq >= from && event.seq < to),
+    } as unknown as Session
+
+    const saves: Array<{ content: string }> = []
+    let call = 0
+    const llm = {
+      stream: vi.fn(async function*() {
+        call += 1
+        const text = call === 1
+          ? '{"status":"complete","incidents":[{"content":"durable fact","evidence":[{"sourceRef":"event:1","quote":"durable fact"}]}]}'
+          : '{"results":[{"candidateId":"candidate_0","status":"accepted","content":"durable fact"}]}'
+        yield { type: 'text-delta', index: 0, text }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }),
+    }
+    const memory: MemoryCommitSurface = {
+      search: async () => ({ backend: 'fake', query: '', count: 0, items: [] }),
+      save: async (_ctx, input) => {
+        saves.push({ content: input.content })
+        return { id: 'x', stored: 1, message: 'stored' }
+      },
+    }
+
+    const backend = new SqliteStorageBackend(new Config({ path: ':memory:' }))
+    const unit = await backend.kv.open(MemoryExtractionControlStore.descriptor)
+    const control = MemoryExtractionControlStore.open(unit)
+    const listener: Array<(session: Session, event: SessionEvent) => void> = []
+    const ctx = {
+      on: vi.fn((_name: string, callback: (session: Session, event: SessionEvent) => void) => {
+        listener.push(callback)
+        return () => { }
+      }),
+      logger: { warn: vi.fn() },
+      llm,
+    } as unknown as Context
+
+    const runtime = new MemoryExtractionRuntime(ctx, {}, control, memory) // default floor 2
+    runtime.attach()
+    listener[0]?.(session, {
+      type: 'compaction/summary',
+      seq: 1,
+      time: 2_000,
+      data: {},
+    } as unknown as SessionEvent)
+
+    await vi.waitFor(async () => {
+      expect(await control.readGaps()).toHaveLength(1)
+    })
+    expect(saves).toHaveLength(0)
+    const gaps = await control.readGaps()
+    expect(gaps[0]).toMatchObject({ content: 'durable fact', covered: false, sightings: [{ sessionId: 's1', at: expect.any(Number) }] })
     expect(await control.readCursor('s1')).toMatchObject({ processedSeq: 1 })
     await unit.close()
     await backend.close()
@@ -206,7 +271,7 @@ describe('MemoryExtractionRuntime', () => {
 })
 
 describe('RuntimeConfig', () => {
-  it('type-level config keys are stable (enabled/backend/provider/model/importance/dedupe/excludeSubagents/timeoutMs)', () => {
+  it('type-level config keys are stable (enabled/backend/provider/model/importance/dedupe/excludeSubagents/timeoutMs/minGapEvidence/gapLedgerMaxAgeMs)', () => {
     const config: RuntimeConfig = {
       enabled: true,
       backend: 'sqlite',
@@ -216,7 +281,10 @@ describe('RuntimeConfig', () => {
       dedupe: true,
       excludeSubagents: true,
       timeoutMs: 60_000,
+      minGapEvidence: 2,
+      gapLedgerMaxAgeMs: 90 * 24 * 60 * 60 * 1000,
     }
     expect(config.enabled).toBe(true)
+    expect(config.minGapEvidence).toBe(2)
   })
 })

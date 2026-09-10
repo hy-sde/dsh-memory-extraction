@@ -97,10 +97,16 @@ export interface MemoryEvidenceCitation {
 /**
  * One proposed memory item (stage 1). Maka's facet set is reduced to content
  * + citations; admission enforces bounds, verbatim quotes, and policy.
+ *
+ * `gapId` (optional) identifies an open cross-session gap this incident
+ * corroborates: the model cites the id of an open pending fact it was shown
+ * instead of coining a paraphrase as a new pending fact. When absent, the
+ * engine falls back to a content-hash identity.
  */
 export interface MemoryProposalItem {
   readonly content: string
   readonly evidence: readonly MemoryEvidenceCitation[]
+  readonly gapId?: string
 }
 
 /** Stage-1 result for an incidental (automatic) extraction. */
@@ -161,10 +167,39 @@ export type MemoryExtractionFailureClass =
   | 'localization'
   | 'admission'
 
+/* ── gap ledger (cross-session evidence floor) ────────────────────────────── */
+
+/** One session's sighting of a pending durable fact. */
+export interface MemoryExtractionGapSighting {
+  readonly sessionId: string
+  /** Unix epoch milliseconds. */
+  readonly at: number
+}
+
+/**
+ * One cross-session evidence entry: a durable fact first proposed by one
+ * session, awaiting corroboration from `minGapEvidence` distinct sessions
+ * before it may be admitted into the memory bank. Retires (covered) once the
+ * fact commits or is found already in the bank; stale sightings expire after
+ * `gapLedgerMaxAgeMs`.
+ */
+export interface MemoryExtractionGapEntry {
+  /** Durable identity: `gap_<hex>` (engine content-hash shape) — what a later proposal pass cites back. */
+  readonly id: string
+  /** Last-seen normalized proposed content (bounded). */
+  readonly content: string
+  readonly sightings: readonly MemoryExtractionGapSighting[]
+  /** True once the fact committed, or was already present in the bank. */
+  readonly covered: boolean
+  /** Unix epoch milliseconds of the covered transition. */
+  readonly coveredAt?: number
+  readonly updatedAt: number
+}
+
 export interface MemoryExtractionReceipt {
   readonly operationId: string
   readonly sessionId: string
-  readonly status: 'extracted' | 'skipped' | 'discarded'
+  readonly status: 'extracted' | 'skipped' | 'discarded' | 'pending'
   /** Committed contents, in commit order (for the result message). */
   readonly items: readonly string[]
   readonly committedAt: number
@@ -201,4 +236,5 @@ export type MemoryExtractionRunResult =
   | { readonly status: 'extracted'; readonly items: readonly string[] }
   | { readonly status: 'skipped' }
   | { readonly status: 'no_range' }
+  | { readonly status: 'pending'; readonly pending: number }
   | { readonly status: 'unavailable'; readonly reason?: string }

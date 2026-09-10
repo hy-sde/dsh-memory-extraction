@@ -53,17 +53,25 @@ export class MemoryCommitAdapter {
     readonly trigger: MemoryExtractionSourceSnapshot['trigger']
     readonly boundarySeq: number
     readonly items: readonly AdmittedMemoryItem[]
-  }): Promise<{ readonly committed: readonly string[] }> {
+  }): Promise<{
+    readonly results: readonly { readonly content: string; readonly outcome: 'committed' | 'duplicate' | 'dropped' }[]
+  }> {
     const context: MemoryContext = input.workspaceKey !== undefined
       ? { cwd: input.workspaceKey }
       : { cwd: process.cwd() }
     const importance = this.config.importance ?? IMPORTANCE_AUTO_EXTRACT
     const dedupe = this.config.dedupe ?? true
-    const committed: string[] = []
+    const results: Array<{ readonly content: string; readonly outcome: 'committed' | 'duplicate' | 'dropped' }> = []
     for (const item of input.items) {
       const content = normalizeProposedMemoryText(item.content)
-      if (content === undefined) continue
-      if (dedupe && await this.isDuplicate(context, content)) continue
+      if (content === undefined) {
+        results.push({ content: item.content, outcome: 'dropped' })
+        continue
+      }
+      if (dedupe && await this.isDuplicate(context, content)) {
+        results.push({ content, outcome: 'duplicate' })
+        continue
+      }
       const result = await this.memory.save(context, {
         content,
         context: `automatic memory extraction from session ${input.sessionId} (compaction checkpoint through seq ${input.boundarySeq})`,
@@ -71,9 +79,9 @@ export class MemoryCommitAdapter {
         importance,
         sessionId: input.sessionId,
       })
-      if (result.stored > 0) committed.push(content)
+      results.push({ content, outcome: result.stored > 0 ? 'committed' : 'dropped' })
     }
-    return { committed }
+    return { results }
   }
 
   private async isDuplicate(context: MemoryContext, content: string): Promise<boolean> {

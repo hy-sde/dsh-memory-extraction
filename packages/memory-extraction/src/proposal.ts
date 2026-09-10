@@ -37,6 +37,11 @@ export const MAX_INCIDENT_ITEMS = 10
 export const MIN_CITATION_QUOTE_CHARS = 4
 export const MAX_SEARCH_TERMS = 8
 export const MAX_CANDIDATES = 20
+/** Model-cited gap ids must be engine-shaped: `gap_` + [A-Za-z0-9_-] (bounded). */
+export const MAX_GAP_ID_CHARS = 80
+export const GAP_ID_RE = /^gap_[A-Za-z0-9_-]{1,64}$/
+/** Cap on open pending facts shown to the proposal model (most recent first). */
+export const MAX_GAP_PROMPT_ENTRIES = 16
 
 /* ── stage-1 parser ──────────────────────────────────────────────────────── */
 
@@ -67,10 +72,19 @@ function parseMemoryProposalItem(value: unknown): MemoryProposalItem | undefined
     }
     evidence.push({ sourceRef, quote })
   }
+  // Optional cross-session corroboration reference (only ids the engine issued).
+  const gapId = value['gapId']
+  if (gapId !== undefined && (typeof gapId !== 'string' || gapId.length > MAX_GAP_ID_CHARS || !GAP_ID_RE.test(gapId))) {
+    return undefined
+  }
   // Strict shape: no unknown keys (mirrors Maka's `.strict()` schemas).
   const keys = Object.keys(value)
-  if (keys.some(key => key !== 'content' && key !== 'evidence')) return undefined
-  return { content, evidence }
+  if (keys.some(key => key !== 'content' && key !== 'evidence' && key !== 'gapId')) return undefined
+  return {
+    content,
+    evidence,
+    ...gapId !== undefined ? { gapId } : {},
+  }
 }
 
 function parseSearch(value: unknown): { terms: readonly string[]; roles?: readonly ('user' | 'assistant')[] } | undefined {
@@ -193,10 +207,32 @@ export function parseMemoryCanonicalization(raw: string): MemoryCanonicalization
 
 /* ── prompt builders ─────────────────────────────────────────────────────── */
 
+/** One open pending fact shown to the proposal model (most recent first). */
+export interface MemoryExtractionGapPromptEntry {
+  readonly id: string
+  readonly content: string
+  /** Distinct sessions that have sighted this pending fact so far. */
+  readonly sessions: number
+}
+
+function memoryGapPromptLines(openGaps: readonly MemoryExtractionGapPromptEntry[]): string[] {
+  if (openGaps.length === 0) return []
+  return [
+    'This extraction may corroborate durable facts already pending evidence from other sessions.',
+    'When a new incident IS the same durable fact as an open pending fact below, set its "gapId" to that fact\'s id and keep the fact\'s meaning aligned; do NOT coin a paraphrased duplicate.',
+    `At most ${MAX_GAP_PROMPT_ENTRIES} open pending facts are shown, most recently sighted first.`,
+    'When citing a gapId, return the incident as {"content":"...","evidence":[{"sourceRef":"event:123","quote":"verbatim excerpt"}],"gapId":"gap_..."} — gapId is optional and only for matching an open pending fact.',
+    '<open_pending_facts>',
+    JSON.stringify(openGaps),
+    '</open_pending_facts>',
+  ]
+}
+
 /** Stage-1 prompt: incidental extraction from the bounded evidence index. */
 export function buildFirstMemoryProposalPrompt(input: {
   readonly now: number
   readonly evidence: readonly MemoryExtractionEvidence[]
+  readonly openGaps?: readonly MemoryExtractionGapPromptEntry[]
 }): string {
   return [
     'Perform the first stage of long-term-memory extraction from a compacted conversation span.',
@@ -214,6 +250,7 @@ export function buildFirstMemoryProposalPrompt(input: {
     '{"status":"search_required","search":{"terms":["..."],"roles":["user","assistant"]}}',
     '{"status":"cannot_resolve"}',
     'Each incident: {"content":"...","evidence":[{"sourceRef":"event:123","quote":"verbatim excerpt"}]}',
+    ...memoryGapPromptLines(input.openGaps ?? []),
     '<memory_evidence>',
     JSON.stringify(renderMemoryExtractionEvidence(input.evidence)),
     '</memory_evidence>',
@@ -225,6 +262,7 @@ export function buildLocalizedMemoryProposalPrompt(input: {
   readonly now: number
   readonly evidence: readonly MemoryExtractionEvidence[]
   readonly interpretationContext: string
+  readonly openGaps?: readonly MemoryExtractionGapPromptEntry[]
 }): string {
   return [
     'Resolve one long-term-memory extraction from this bounded same-session history search.',
@@ -239,6 +277,7 @@ export function buildLocalizedMemoryProposalPrompt(input: {
     '{"status":"complete","incidents":[]}',
     '{"status":"cannot_resolve"}',
     'Each incident: {"content":"...","evidence":[{"sourceRef":"event:123","quote":"verbatim excerpt"}]}',
+    ...memoryGapPromptLines(input.openGaps ?? []),
     '<memory_evidence>',
     JSON.stringify(renderMemoryExtractionEvidence(input.evidence)),
     '</memory_evidence>',

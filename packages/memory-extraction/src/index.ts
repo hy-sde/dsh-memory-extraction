@@ -49,6 +49,10 @@ export interface Config extends RuntimeConfig {
   excludeSubagents?: boolean
   /** Auxiliary call timeout in milliseconds (default 60 000). */
   timeoutMs?: number
+  /** Distinct sessions a fact needs before committing (default 2; 0 keeps pre-E1 behavior). */
+  minGapEvidence?: number
+  /** Gap sightings older than this stop counting (default 90 days, ms). */
+  gapLedgerMaxAgeMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -60,6 +64,8 @@ export const Config: z<Config> = z.object({
   dedupe: z.boolean().default(true),
   excludeSubagents: z.boolean().default(true),
   timeoutMs: z.number().step(1).min(1),
+  minGapEvidence: z.number().step(1).min(0).default(2),
+  gapLedgerMaxAgeMs: z.number().step(1).min(1).default(90 * 24 * 60 * 60 * 1000),
 })
 
 export const name = 'memory-extraction'

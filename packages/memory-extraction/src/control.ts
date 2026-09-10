@@ -1,9 +1,16 @@
 /**
  * The memory-extraction control store: durable per-session cursor, idempotency
- * receipts, and the single pending-failure record, over one {@link KvUnit}
- * (`memory_extraction`). Same pattern as `dsh-graph-control`: single write
- * chain, heal-on-open, no SQL transactions (the storage contract already
- * forbids concurrent writers on one unit).
+ * receipts, the single pending-failure record, and the cross-session gap
+ * ledger, over one {@link KvUnit} (`memory_extraction`). Same pattern as
+ * `dsh-graph-control`: single write chain, heal-on-open, no SQL transactions
+ * (the storage contract already forbids concurrent writers on one unit).
+ *
+ * The `gaps` table is ADDITIVE and the unit version stays 1 on purpose: the
+ * storage-sqlite backend stamps a unit's version on the medium at first
+ * materialization and rejects any mismatch on reopen (no migrations exist), so
+ * a version bump would brick every existing control unit on upgrade. Adding a
+ * table is the compatible path: `CREATE TABLE IF NOT EXISTS` at open
+ * materializes `gaps` on an existing v1 unit with no data loss.
  *
  * Write ordering is load-bearing: the CURSOR is written before the receipt so
  * a crash between the two can never double-process a range (the next trigger's
@@ -15,6 +22,8 @@
 import type { KvUnit } from '@deepseek-ai/dsh-storage'
 import type {
   MemoryExtractionCursor,
+  MemoryExtractionGapEntry,
+  MemoryExtractionGapSighting,
   MemoryExtractionReceipt,
   PendingMemoryExtractionFailure,
 } from './types.ts'
@@ -22,7 +31,7 @@ import type {
 export const MEMORY_EXTRACTION_CONTROL_UNIT_NAME = 'memory_extraction'
 export const MEMORY_EXTRACTION_CONTROL_UNIT_VERSION = 1
 
-const UNIT_TABLES = ['cursors', 'receipts', 'failures'] as const
+const UNIT_TABLES = ['cursors', 'receipts', 'failures', 'gaps'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -140,5 +149,59 @@ export class MemoryExtractionControlStore {
 
   deleteFailure(sessionId: string): Promise<void> {
     return this.withChain(() => this.kv.deleteRecord('failures', sessionId))
+  }
+
+  /* ── gap ledger (cross-session evidence floor) ────────────────────────── */
+
+  /** Read every gap entry (open and covered). The engine applies expiry/floor math. */
+  async readGaps(): Promise<readonly MemoryExtractionGapEntry[]> {
+    const { tables } = await this.kv.loadAll()
+    const rows = tables['gaps'] ?? {}
+    const entries: MemoryExtractionGapEntry[] = []
+    for (const [id, value] of Object.entries(rows)) {
+      const entry = parseGapEntry(id, value)
+      if (entry !== undefined) entries.push(entry)
+    }
+    return entries
+  }
+
+  writeGap(entry: MemoryExtractionGapEntry): Promise<void> {
+    return this.withChain(() => this.kv.putRecord('gaps', entry.id, { ...entry }))
+  }
+
+  deleteGap(id: string): Promise<void> {
+    return this.withChain(() => this.kv.deleteRecord('gaps', id))
+  }
+}
+
+function parseGapEntry(id: string, value: unknown): MemoryExtractionGapEntry | undefined {
+  if (!isRecord(value)) return undefined
+  const content = value['content']
+  const sightings = value['sightings']
+  const covered = value['covered']
+  const updatedAt = value['updatedAt']
+  if (
+    typeof id !== 'string' || id.length < 1
+    || typeof content !== 'string' || content.length < 1
+    || !Array.isArray(sightings) || typeof covered !== 'boolean' || typeof updatedAt !== 'number'
+  ) {
+    return undefined
+  }
+  const parsed: MemoryExtractionGapSighting[] = []
+  for (const sighting of sightings) {
+    if (!isRecord(sighting)) return undefined
+    const sessionId = sighting['sessionId']
+    const at = sighting['at']
+    if (typeof sessionId !== 'string' || sessionId.length < 1 || typeof at !== 'number') return undefined
+    parsed.push({ sessionId, at })
+  }
+  const coveredAt = value['coveredAt']
+  return {
+    id,
+    content,
+    sightings: parsed,
+    covered,
+    ...typeof coveredAt === 'number' ? { coveredAt } : {},
+    updatedAt,
   }
 }

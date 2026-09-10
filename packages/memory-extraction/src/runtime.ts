@@ -53,6 +53,10 @@ export interface RuntimeConfig {
   readonly excludeSubagents?: boolean
   /** Auxiliary call timeout (default 60 000 ms). */
   readonly timeoutMs?: number
+  /** Distinct sessions a fact needs before committing (default 2; 0 keeps pre-E1 behavior). */
+  readonly minGapEvidence?: number
+  /** Gap sightings older than this stop counting (default 90 days, ms). */
+  readonly gapLedgerMaxAgeMs?: number
 }
 
 interface RunFacts {
@@ -111,7 +115,10 @@ export class MemoryExtractionRuntime {
       ...header.delegationDepth !== undefined ? { delegationDepth: header.delegationDepth } : {},
     }
     const ports = this.portsFor(session, snapshot)
-    const engine = new MemoryExtractionEngine(ports)
+    const engine = new MemoryExtractionEngine(ports, {
+      ...this.config.minGapEvidence !== undefined ? { minGapEvidence: this.config.minGapEvidence } : {},
+      ...this.config.gapLedgerMaxAgeMs !== undefined ? { gapLedgerMaxAgeMs: this.config.gapLedgerMaxAgeMs } : {},
+    })
     return { snapshot, run: () => engine.execute(snapshot) }
   }
 
@@ -137,6 +144,9 @@ export class MemoryExtractionRuntime {
       writeReceipt: (receipt: MemoryExtractionReceipt) => this.control.writeReceipt(receipt),
       writeFailure: (failure: PendingMemoryExtractionFailure) => this.control.writeFailure(failure),
       deleteFailure: (sessionId: string) => this.control.deleteFailure(sessionId),
+      readGaps: () => this.control.readGaps(),
+      writeGap: entry => this.control.writeGap(entry),
+      deleteGap: id => this.control.deleteGap(id),
       commitItems: input => adapter.commitItems(input),
       generate: input => this.generate(input.prompt, {
         ...snapshot.provider !== undefined ? { provider: snapshot.provider } : {},
