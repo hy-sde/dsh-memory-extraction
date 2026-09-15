@@ -1,8 +1,3 @@
----
-description: "在压缩检查点自动提取长期记忆：证据投影、提案/规范化流水线、受门控的 ctx.memory 提交，以及持久化的游标/回执/失败账本（Maka 移植，切片 No. 2）。"
-kind: "package-reference"
----
-
 # @hy-sde-org/dsh-memory-extraction
 
 [English](README.md) | 中文
@@ -69,8 +64,7 @@ kind: "package-reference"
 ```
 
 其存储后端必须暴露 `kv` 面（shipped 的 `sqlite` 后端可以；`storage-json`
-不可以）—— 参见
-[示例补丁](../../../apps/cli/config/examples/memory-extraction/cordis.yml)。
+不可以）—— 上面展示的行即完整主机接线。
 引擎本身是纯的，可在无 cordis 下测试：
 
 ```ts
@@ -110,7 +104,7 @@ const result = await engine.execute(snapshot)   // never throws; idempotent by o
 <a id="further-exploration"></a>
 ## 进一步探索
 
-- 移植来源：Maka 仓库 `packages/runtime/src/memory-extraction.ts`。
+- 移植来源：[Maka 的 `memory-extraction.ts`](https://github.com/apache/maka/blob/main/packages/runtime/src/memory-extraction.ts)。
 - 产生边界事件的压缩生命周期：`@deepseek-ai/dsh-compaction`。
 
 <a id="model-experience"></a>

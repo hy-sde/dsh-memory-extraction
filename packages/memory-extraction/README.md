@@ -1,8 +1,3 @@
----
-description: "Automatic long-term-memory extraction at compaction checkpoints: evidence projection, proposal/canonicalization pipeline, gated ctx.memory commit, durable cursors/receipts/failure ledger, and a cross-session evidence floor (Maka port, slice No. 2)."
-kind: "package-reference"
----
-
 # @hy-sde-org/dsh-memory-extraction
 
 English | [中文](README.zh.md)
@@ -89,8 +84,7 @@ every session's events. There is no agent-preset contribution and no tool.
 ```
 
 Its storage backend must expose a `kv` facet (the shipped `sqlite` backend
-does; `storage-json` does not) — see the
-[example patch](../../../apps/cli/config/examples/memory-extraction/cordis.yml).
+does; `storage-json` does not) — the row above is the complete host wiring.
 The engine itself is pure and testable without cordis:
 
 ```ts
@@ -134,8 +128,7 @@ plugin inert instead of failing composition.
 
 ## Further Exploration
 
-- The Maka source this was ported from: `packages/runtime/src/memory-extraction.ts`
-  in the Maka repository.
+- The Maka source this was ported from: [`memory-extraction.ts`](https://github.com/apache/maka/blob/main/packages/runtime/src/memory-extraction.ts).
 - The compaction lifecycle that emits the boundary events:
   `@deepseek-ai/dsh-compaction`.
 
