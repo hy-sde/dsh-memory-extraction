@@ -1,8 +1,8 @@
 {
   "name": "dsh-memory-extraction",
-  "version": "0.1.5-rc.1",
+  "version": "0.1.6-alpha.2",
   "private": true,
-  "description": "Standalone package: @hy-sde-org/dsh-memory-extraction — automatic long-term-memory extraction at compaction (evidence-grounding, proposal/admission/canonicalization, per-session cursors) for the DeepSeek Harness.",
+  "description": "Standalone package: @hy-sde-org/dsh-memory-extraction \u2014 automatic long-term-memory extraction at compaction (evidence-grounding, proposal/admission/canonicalization, per-session cursors) for the DeepSeek Harness.",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
