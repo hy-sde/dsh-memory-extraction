@@ -15,7 +15,13 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { FinishReason, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, FinishReason, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** @persistenceAttribution */
+    'dsh-memory-extraction': { kind: 'dsh-memory-extraction' } & ContextFormed
+  }
+}
 import { storageBackendServiceKey } from '@deepseek-ai/dsh-storage'
 import type { KvUnit, StorageBackend } from '@deepseek-ai/dsh-storage'
 import { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
@@ -169,7 +175,7 @@ export class MemoryExtractionRuntime {
     const messages: Message[] = [
       createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'dsh-memory-extraction' },
+        source: { kind: 'dsh-memory-extraction', plugin: 'dsh-memory-extraction' },
       }),
     ]
     const options: GenerateOptions = {
