@@ -206,7 +206,7 @@ All options are optional; the row's `config:` fills the defaults.
 | Node.js | 22.19 or newer (`engines.node >=22.19.0`) |
 | DeepSeek Harness | `0.2.0-rc.2` peer range (`@deepseek-ai/cordis ~4.0.4`; `dsh-compaction`, `dsh-llm`, `dsh-session`, `dsh-storage` `^0.2.0-rc.2`) |
 | Memory bank | `@hy-sde-org/dsh-memory` (`ctx.memory` seam) |
-| Storage backend | must expose a `kv` facet — shipped `sqlite` yes, `storage-json` no |
+| Storage backend | must expose a `kv` facet — shipped `sqlite` and `storage-json` both yes |
 
 Upstream seam-contract changes require a new package release and contract
 review.
