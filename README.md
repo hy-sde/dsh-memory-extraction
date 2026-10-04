@@ -45,7 +45,7 @@ load-bearing rules are ported from Maka and enforced by the engine:
 
 - **Evidence is user-authored text only** — assistant text is
   interpretation-only; tool calls/results and reasoning are opaque. Evidence is
-  bounded (12 000 chars JSON / 4 000 chars per record / 64 records) and
+  bounded (12 000 chars of JSON / 4 000 chars per record) and
   fail-closed on overflow.
 - **Admission is verified** — proposal → admission (verbatim-quote check
   against the bounded evidence + secret rejection) → canonicalization →
@@ -72,8 +72,8 @@ load-bearing rules are ported from Maka and enforced by the engine:
   `^0.2.0-rc.2` — including the standard `dsh` CLI;
 - the [`@hy-sde-org/dsh-memory`](../dsh-memory/README.md) plugin mounted —
   extraction commits into its `ctx.memory` bank;
-- a storage backend exposing a `kv` facet — the shipped `sqlite` backend does;
-  `storage-json` does not. Nothing else: no API keys (the auxiliary calls reuse
+- a storage backend exposing a `kv` facet — both shipped backends (`sqlite`
+  and `storage-json`) do. Nothing else: no API keys (the auxiliary calls reuse
   the session's routed model unless you configure `provider`/`model`).
 
 Install the Harness CLI and pnpm before continuing:
@@ -123,8 +123,8 @@ before any session):
 git clone git@github.com:hy-sde/dsh-plugins.git
 cd dsh-plugins
 pnpm install
-PACKAGE_TARBALL="$(cd dsh-memory-extraction/packages/memory-extraction && pnpm pack --silent)"
-dsh plugin --profile web add "dsh-memory-extraction/packages/memory-extraction/$PACKAGE_TARBALL"
+PACKAGE_TARBALL="$(cd dsh-memory-extraction/packages/memory-extraction && pnpm pack --pack-destination /tmp | tail -n 1)"
+dsh plugin --profile web add "$PACKAGE_TARBALL"
 ```
 
 `pnpm pack` runs the normal `prepack` build and produces a tarball containing
@@ -195,7 +195,7 @@ All options are optional; the row's `config:` fills the defaults.
 | `provider`, `model` | unset | auxiliary model route; unset uses the session's routed request header. A cheap auxiliary model is recommended for large deployments |
 | `importance` | `0.5` | bank importance for auto-extracted facts |
 | `dedupe` | `true` | probe the bank before committing duplicates |
-| `timeoutMs` | `60000` | per-range auxiliary call budget (≤ 3 calls) |
+| `timeoutMs` | `60000` | per auxiliary-call timeout; a range makes up to 3 auxiliary calls |
 | `minGapEvidence` | `2` | distinct sessions before a fact commits; `0` disables the floor |
 | `gapLedgerMaxAgeMs` | `7776000000` | sightings older than this stop counting (90 d); `0` disables the ledger |
 
